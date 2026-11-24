@@ -10,7 +10,7 @@ I wanted to hear Muse's replies through the gadget's speaker when I talk to the 
 
 The stock SDK had a test feature for playing MP3s, so I used that processing and added a command that lets Muse ask, "play this MP3."
 
-*Because it takes the form of a command addition, even if the SDK itself is updated, the impact of fixes stays within the added parts.*
+*Since the patch mainly adds a new command, I expect only minor changes will be needed when the SDK is updated.*
 
 ## Usage examples
 

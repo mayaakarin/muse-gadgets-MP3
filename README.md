@@ -22,8 +22,7 @@ path指定となっていますが、実際はpathは不要です。museの内�
 
 ## パッチの当て方
 
-対象は Muse Gadget SDK の upstream main の ded4222（2026-11-21、#490）です。`ded4222` のクリーンなツリーを用意し、SDKのルートで実行します。v1を適用済みなら、別の作業ツリーを使ってください。
-
+対象は Muse Gadget SDK の upstream main の ded4222（2026-11-21、#490）です。`ded4222` のクリーンなツリーを用意し、SDKのルートで実行します。
 ```
 git apply media_file.patch
 ```

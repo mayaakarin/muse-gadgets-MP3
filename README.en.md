@@ -22,7 +22,7 @@ It is specified as a path, but in practice the path is not something to worry ab
 
 ## Applying the patch
 
-The target is Muse Gadget SDK upstream main ded4222 (2026-11-21, #490). Prepare a clean `ded4222` tree and run this at the SDK root. If v1 is already applied, use a different working tree.
+The target is Muse Gadget SDK upstream main ded4222 (2026-11-21, #490). Prepare a clean `ded4222` tree and run this at the SDK root.
 
 ```
 git apply media_file.patch

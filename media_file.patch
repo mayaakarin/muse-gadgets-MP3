@@ -1,0 +1,767 @@
+diff --git a/esp32/components/muse/muse_voice.c b/esp32/components/muse/muse_voice.c
+index b0d9713..221e589 100644
+--- a/esp32/components/muse/muse_voice.c
++++ b/esp32/components/muse/muse_voice.c
+@@ -151,6 +151,9 @@ static volatile float s_monitor_db = -100.0f;
+ static volatile bool s_chirp;
+ static volatile bool s_loopback;
+ static volatile bool s_mp3test;
++static int16_t *s_media_pcm;   /* PCM handed over by muse_voice_request_pcm; the voice task frees it */
++static size_t s_media_samples;
++static volatile bool s_media_play;
+ static atomic_int s_call_view;
+ static atomic_bool s_ptt_call;
+ static atomic_bool s_shutdown;
+@@ -1727,7 +1730,7 @@ static void voice_task(void *arg)
+             /* The wake word opt-in keeps the codecs powered. Not
+              * muse_wakeword_listening(): it reads false while resting, and
+              * briefly after a reply until the wake task applies playback off. */
+-            bool rest = asleep && battery && !s_chirp && !s_mp3test && !s_loopback && !muse_wakeword_enabled();
++            bool rest = asleep && battery && !s_chirp && !s_mp3test && !s_media_play && !s_loopback && !muse_wakeword_enabled();
+ #if HOLD_NOTES
+             /* A press goes first: send_held() leaves it queued and returns
+              * without backing off, so retrying before it's read would spin. */
+@@ -1773,6 +1776,20 @@ static void voice_task(void *arg)
+                 muse_wakeword_set_playback(false);
+                 pre_reset();
+             }
++            if (s_media_play) {
++                s_media_play = false;
++                int16_t *pcm = s_media_pcm;
++                size_t n = s_media_samples;
++                s_media_pcm = NULL;
++                s_media_samples = 0;
++                muse_wakeword_set_playback(true);
++                for (size_t i = 0; i < n; i += MUSE_AUDIO_CHUNK) {
++                    muse_audio_write(pcm + i, n - i < MUSE_AUDIO_CHUNK ? n - i : MUSE_AUDIO_CHUNK);
++                }
++                free(pcm);
++                muse_wakeword_set_playback(false);
++                pre_reset();
++            }
+             if (s_loopback) {
+                 s_loopback = false;
+                 muse_wakeword_set_playback(true);
+@@ -1991,6 +2008,18 @@ void muse_voice_request_mp3test(void)
+     muse_state_nudge();
+ }
+ 
++bool muse_voice_request_pcm(int16_t *pcm, size_t samples)
++{
++    if (!pcm || !samples || s_media_play) {
++        return false;
++    }
++    s_media_pcm = pcm;
++    s_media_samples = samples;
++    s_media_play = true;
++    muse_state_nudge();
++    return true;
++}
++
+ bool muse_voice_resting(void)
+ {
+     return s_resting;
+diff --git a/esp32/components/muse/muse_voice.h b/esp32/components/muse/muse_voice.h
+index 6fbbb31..5a5acbe 100644
+--- a/esp32/components/muse/muse_voice.h
++++ b/esp32/components/muse/muse_voice.h
+@@ -79,6 +79,12 @@ void muse_voice_request_loopback(void);
+ /* Bench test: decodes and plays a built-in MP3 reply. */
+ void muse_voice_request_mp3test(void);
+ 
++/* Plays caller-decoded 16 kHz mono PCM from the voice task, taking
++ * ownership of the buffer (freed after playback). Only one play may be
++ * pending; returns false, keeping ownership with the caller, when one
++ * already is. */
++bool muse_voice_request_pcm(int16_t *pcm, size_t samples);
++
+ /* Asleep with nothing to play: codecs off, Wi-Fi dozing. */
+ bool muse_voice_resting(void);
+ 
+diff --git a/esp32/main/CMakeLists.txt b/esp32/main/CMakeLists.txt
+index bec93e1..513e97e 100644
+--- a/esp32/main/CMakeLists.txt
++++ b/esp32/main/CMakeLists.txt
+@@ -38,6 +38,7 @@ set(GADGET_SRCS
+     "bug_report.c"
+     "ota.c"
+     "image_fetch.c"
++    "muse_media.c"
+     "../avatar/happy_anim.c"
+     "pixel_font.c"
+     "button.c"
+@@ -81,6 +82,7 @@ set(GADGET_REQUIRES
+     mbedtls
+     efuse
+     muse
++    minimp3
+     # WebAssembly apps (CONFIG_MUSE_WASM_APPS); without them it builds nothing.
+     muse_apps
+     # The M5Stack CoreMatrix's board support; it builds nothing on other boards.
+diff --git a/esp32/main/Kconfig.projbuild b/esp32/main/Kconfig.projbuild
+index 58b292e..9d82f12 100644
+--- a/esp32/main/Kconfig.projbuild
++++ b/esp32/main/Kconfig.projbuild
+@@ -717,6 +717,18 @@ menu "ESP32 Device SDK"
+             image: the display backends, the LED matrix, and boards with the
+             full UI, PSRAM for the image and a JPEG decoder in ROM or hardware.
+ 
++    config HOMEHUB_MP3_COMMAND
++        bool "media.file command (play an MP3 file held on the VM)"
++        depends on HOMEHUB_DISPLAY_COMMANDS
++        default n
++        help
++            Adds the media.file Link command: the gadget fetches an MP3
++            file from the VM and plays it, replying when playback
++            starts. Off unless a build turns it on. Playback goes
++            through the voice task (muse_voice_request_pcm), so
++            enabling this on a board built without MUSE_ENABLED fails
++            the build rather than silently leaving the command out.
++
+     config HOMEHUB_PRE_DVT_GPIO
+         bool "Use pre-DVT GPIO assignments"
+         depends on HOMEHUB_LED_BACKEND_PWM_RGB
+diff --git a/esp32/main/app.c b/esp32/main/app.c
+index faa701a..9b50800 100644
+--- a/esp32/main/app.c
++++ b/esp32/main/app.c
+@@ -64,6 +64,7 @@
+ #include "vm_connect.h"
+ #include "noise_control.h"
+ #include "image_fetch.h"
++#include "muse_media.h"
+ #include "noise_tunnel.h"
+ #include "led_status.h"
+ #include "button.h"
+@@ -1751,6 +1752,25 @@ static void draw_url_done(const image_fetch_result_t *r, void *user) {
+     noise_ctrl_send_command_result(ctx->session_generation, ctx->request_id, result);
+     free(ctx);
+ }
++
++#if CONFIG_HOMEHUB_MP3_COMMAND
++static void media_done(const muse_media_result_t *r, void *user) {
++    draw_url_ctx_t *ctx = user;
++    cJSON *result = cJSON_CreateObject();
++    cJSON_AddBoolToObject(result, "ok", r->ok);
++    if (r->ok) {
++        cJSON *payload = cJSON_AddObjectToObject(result, "payload");
++        cJSON_AddNumberToObject(payload, "bytes", (double)r->bytes);
++        cJSON_AddNumberToObject(payload, "ms", r->ms);
++    } else {
++        cJSON *error = cJSON_AddObjectToObject(result, "error");
++        cJSON_AddStringToObject(error, "code", r->code);
++        cJSON_AddStringToObject(error, "message", r->message);
++    }
++    noise_ctrl_send_command_result(ctx->session_generation, ctx->request_id, result);
++    free(ctx);
++}
++#endif
+ #endif
+ 
+ #if CONFIG_MUSE_WATCHER_CAMERA || CONFIG_MUSE_P4_CSI_CAMERA || CONFIG_MUSE_MOSAICO_CAMERA
+@@ -2179,6 +2199,27 @@ static cJSON *on_ws_command(
+         cJSON_AddBoolToObject(result, "ok", true);
+         return result;
+     }
++#if CONFIG_HOMEHUB_MP3_COMMAND
++    if (strcmp(command, "media.file") == 0) {
++        // media.file takes a path on the VM and plays the MP3 there.
++        cJSON *target = cJSON_GetObjectItem(params, "path");
++        if (!cJSON_IsString(target) || !target->valuestring || !target->valuestring[0]) {
++            return command_error("missing_param", "path is required");
++        }
++        draw_url_ctx_t *ctx = calloc(1, sizeof(*ctx));
++        if (!ctx) return command_error("out_of_memory", "failed to allocate");
++        ctx->session_generation = session_generation;
++        strncpy(ctx->request_id, request_id, sizeof(ctx->request_id) - 1);
++        const char *code, *message;
++        if (!muse_media_start(target->valuestring, media_done, ctx, &code, &message)) {
++            free(ctx);
++            return command_error(code, message);
++        }
++        cJSON *async = cJSON_CreateObject();
++        cJSON_AddBoolToObject(async, "_async", true);
++        return async;
++    }
++#endif
+ #endif
+ #if CONFIG_MUSE_WATCHER_CAMERA || CONFIG_MUSE_P4_CSI_CAMERA || CONFIG_MUSE_MOSAICO_CAMERA
+     if (strcmp(command, "camera.capture") == 0) {
+diff --git a/esp32/main/muse_media.c b/esp32/main/muse_media.c
+new file mode 100644
+index 0000000..9010d38
+--- /dev/null
++++ b/esp32/main/muse_media.c
+@@ -0,0 +1,490 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "muse_media.h"
++#include "vm_file_path.h"
++#include "noise_control.h"
++#include "sdkconfig.h"
++
++#if CONFIG_HOMEHUB_MP3_COMMAND
++
++#include <stdatomic.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "esp_heap_caps.h"
++#include "esp_log.h"
++#include "esp_timer.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/queue.h"
++#include "freertos/semphr.h"
++#include "freertos/task.h"
++
++#include "minimp3.h"
++#include "muse_voice.h"
++
++static const char *TAG = "link.media";
++
++#define MEDIA_POLL_MS          20
++#define MEDIA_DEADLINE_MS      60000
++#define MEDIA_MAX_BYTES        (512 * 1024)
++#define MEDIA_STACK_BYTES      (32 * 1024)   /* minimp3 wants ~16 KB */
++#define MEDIA_OUT_RATE         16000         /* muse_audio's rate */
++#define MEDIA_MAX_SAMPLES      (MEDIA_OUT_RATE * 60)
++#define MEDIA_HANDOFF_TRIES    100           /* 100 x 50 ms for the voice task's slot */
++#define MEDIA_HANDOFF_POLL_MS  50
++
++static atomic_bool s_busy;
++
++// The reply to the one GET /fs/raw in flight, written into the fetch's
++// buffer on the Noise session task. Frames of an earlier request,
++// cancelled or timed out, carry an older generation and are dropped, so
++// the fetch task never waits on them and they never touch the buffer.
++// (The same arrangement as image_fetch.c's, kept separate so this file
++// stands alone.)
++static struct {
++    SemaphoreHandle_t lock;
++    uint32_t generation;
++    int64_t request_id;
++    int status;
++    uint8_t *buf;
++    size_t cap;
++    size_t len;
++    bool complete;
++    bool too_large;
++} s_rx;
++
++static void media_on_frame(void *ctx, int status, const uint8_t *data, size_t len, bool end) {
++    uint32_t generation = (uint32_t)(uintptr_t)ctx;
++    xSemaphoreTake(s_rx.lock, portMAX_DELAY);
++    if (generation == s_rx.generation) {
++        if (status != 0) {
++            s_rx.status = status;
++        }
++        if (status == NOISE_CTRL_REQ_TOO_LARGE) {
++            s_rx.too_large = true;
++            s_rx.complete = true;
++        } else if (data && len) {
++            if (s_rx.len + len <= s_rx.cap) {
++                memcpy(s_rx.buf + s_rx.len, data, len);
++                s_rx.len += len;
++            } else {
++                s_rx.too_large = true;
++            }
++        }
++        if (end) {
++            s_rx.complete = true;
++        }
++    }
++    xSemaphoreGive(s_rx.lock);
++}
++
++// One bounded read of a file held on the VM, over the session's request
++// stream. False with s_rx.status set on failure; true once the reply is
++// whole, with the bytes in s_rx.buf and their count in s_rx.len.
++static bool media_get_range(const char *url_path, size_t off, size_t want, int64_t deadline_us) {
++    char range[48];
++    snprintf(range, sizeof(range), "bytes=%u-%u", (unsigned)off, (unsigned)(off + want - 1));
++    const char *headers[] = {"Range", range, NULL};
++    xSemaphoreTake(s_rx.lock, portMAX_DELAY);
++    s_rx.generation++;
++    s_rx.status = 0;
++    s_rx.len = 0;
++    s_rx.complete = false;
++    s_rx.too_large = false;
++    uint32_t generation = s_rx.generation;
++    xSemaphoreGive(s_rx.lock);
++
++    int64_t id = noise_ctrl_req_open("GET", url_path, headers, true, media_on_frame,
++                                     (void *)(uintptr_t)generation);
++    if (!id) {
++        return false;
++    }
++    xSemaphoreTake(s_rx.lock, portMAX_DELAY);
++    s_rx.request_id = id;
++    xSemaphoreGive(s_rx.lock);
++
++    while (esp_timer_get_time() < deadline_us) {
++        xSemaphoreTake(s_rx.lock, portMAX_DELAY);
++        bool done = s_rx.complete;
++        int status = s_rx.status;
++        xSemaphoreGive(s_rx.lock);
++        if (done) {
++            return status != -1;
++        }
++        vTaskDelay(pdMS_TO_TICKS(MEDIA_POLL_MS));
++    }
++    noise_ctrl_req_cancel(id);
++    return false;
++}
++
++// Fetches the whole file at url_path into a fresh PSRAM buffer. The
++// reply to each Range request is bounded by the session's frame size,
++// so the file arrives in pieces; a 200 at offset 0 means the daemon
++// sent the whole file at once, a 416 or a short read the end of it.
++// On failure returns NULL and sets *code and *message (into msg).
++static uint8_t *media_fetch(const char *url_path, size_t *len_out,
++                            const char **code, char *msg, size_t msg_len) {
++    size_t chunk = noise_ctrl_req_max_body();
++    if (chunk > MEDIA_MAX_BYTES) chunk = MEDIA_MAX_BYTES;
++    size_t alloc_cap = chunk;
++    uint8_t *buf = heap_caps_malloc(alloc_cap, MALLOC_CAP_SPIRAM);
++    if (!buf) {
++        *code = "out_of_memory";
++        snprintf(msg, msg_len, "could not allocate the media buffer");
++        return NULL;
++    }
++    s_rx.buf = buf;
++    s_rx.cap = alloc_cap;
++
++    int64_t deadline = esp_timer_get_time() + (int64_t)MEDIA_DEADLINE_MS * 1000;
++    size_t len = 0;
++    bool eof = false;
++    while (!eof) {
++        /* The callback appends at s_rx.buf + s_rx.len, with s_rx.len reset
++         * per request: aim it at this chunk's place in the whole buffer. */
++        s_rx.buf = buf + len;
++        s_rx.cap = alloc_cap - len;
++        size_t want = chunk;
++        if (want > MEDIA_MAX_BYTES + 1 - len) want = MEDIA_MAX_BYTES + 1 - len;
++        if (!media_get_range(url_path, len, want, deadline)) {
++            heap_caps_free(buf);
++            *code = "fetch_failed";
++            snprintf(msg, msg_len, "the media request did not complete");
++            return NULL;
++        }
++        if (s_rx.too_large) {
++            heap_caps_free(buf);
++            *code = "too_large";
++            snprintf(msg, msg_len, "media file is larger than %d bytes", MEDIA_MAX_BYTES);
++            return NULL;
++        }
++        if (s_rx.status == 416) {
++            if (len == 0) {
++                heap_caps_free(buf);
++                *code = "fetch_failed";
++                snprintf(msg, msg_len, "media file not found or empty");
++                return NULL;
++            }
++            eof = true;
++        } else if (s_rx.status == 200) {
++            if (len != 0) {
++                heap_caps_free(buf);
++                *code = "fetch_failed";
++                snprintf(msg, msg_len, "the server answered a range request with the whole file");
++                return NULL;
++            }
++            len = s_rx.len;
++            eof = true;
++        } else if (s_rx.status == 206 || s_rx.status == 0) {
++            if (s_rx.len == 0 && len == 0) {
++                heap_caps_free(buf);
++                *code = "fetch_failed";
++                snprintf(msg, msg_len, "media request failed (status %d)", s_rx.status);
++                return NULL;
++            }
++            len += s_rx.len;
++            if (s_rx.len < want) eof = true;
++        } else {
++            heap_caps_free(buf);
++            *code = "fetch_failed";
++            snprintf(msg, msg_len, "media request failed (status %d)", s_rx.status);
++            return NULL;
++        }
++        if (!eof && len == alloc_cap) {
++            if (alloc_cap >= MEDIA_MAX_BYTES + 1) {
++                heap_caps_free(buf);
++                *code = "too_large";
++                snprintf(msg, msg_len, "media file is larger than %d bytes", MEDIA_MAX_BYTES);
++                return NULL;
++            }
++            size_t next = alloc_cap * 2;
++            if (next > MEDIA_MAX_BYTES + 1) next = MEDIA_MAX_BYTES + 1;
++            uint8_t *grown = heap_caps_realloc(buf, next, MALLOC_CAP_SPIRAM);
++            if (!grown) {
++                heap_caps_free(buf);
++                *code = "out_of_memory";
++                snprintf(msg, msg_len, "could not grow the media buffer");
++                return NULL;
++            }
++            buf = grown;
++            alloc_cap = next;
++            s_rx.buf = buf + len;
++            s_rx.cap = alloc_cap - len;
++        }
++    }
++    if (len > MEDIA_MAX_BYTES) {
++        heap_caps_free(buf);
++        *code = "too_large";
++        snprintf(msg, msg_len, "media file is larger than %d bytes", MEDIA_MAX_BYTES);
++        return NULL;
++    }
++    *len_out = len;
++    return buf;
++}
++
++// --- The job and its reply ----------------------------------------------
++
++typedef struct {
++    char path[256];
++    muse_media_done_cb done;
++    void *user;
++    int64_t t0_us;
++    bool replied;
++} media_job_t;
++
++static void media_reply(media_job_t *job, bool ok, size_t bytes,
++                        const char *code, const char *message) {
++    if (job->replied) return;
++    job->replied = true;
++    muse_media_result_t r = {
++        .ok = ok,
++        .bytes = bytes,
++        .ms = (uint32_t)((esp_timer_get_time() - job->t0_us) / 1000),
++        .code = code,
++        .message = message,
++    };
++    job->done(&r, job->user);
++}
++
++// --- Decode -------------------------------------------------------------
++// A transplant of mp3_selftest() in muse_chat_session.cpp, retargeted
++// from the embedded bench-test file to the fetched buffer: the whole
++// MP3 is decoded to 16 kHz mono PCM in PSRAM (psram_alloc, the SDK's
++// resampler, the same stereo downmix), which the voice task then plays
++// and frees. Two deliberate differences: the output cap is
++// MEDIA_MAX_SAMPLES (60 s) instead of the selftest's 10 s, and running
++// out of cap stops the decode the same way the selftest's does.
++
++static void *psram_alloc(size_t n) {
++    return heap_caps_malloc_prefer(n, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_DEFAULT);
++}
++
++typedef struct {
++    uint32_t step;           /* Q16 input samples per output sample */
++    uint32_t pos;
++    int16_t prev;
++} resampler_t;
++
++static void resampler_init(resampler_t *r, int in_rate, int out_rate) {
++    r->step = (uint32_t)(((uint64_t)in_rate << 16) / out_rate);
++    r->pos = 0;
++    r->prev = 0;
++}
++
++/* Linear interpolation; state carries across calls. out must hold n*out/in + 2. */
++static size_t resample(resampler_t *r, const int16_t *in, size_t n, int16_t *out) {
++    size_t o = 0;
++    if (!n) {
++        return 0;
++    }
++    /* Position 0 is the previous call's last sample, k is in[k-1]. */
++    while ((r->pos >> 16) < n) {
++        size_t i = r->pos >> 16;
++        int32_t a = i ? in[i - 1] : r->prev;
++        int32_t b = in[i];
++        /* (b - a) spans 17 bits and the fraction 16, so the product needs 64. */
++        out[o++] = (int16_t)(a + (int32_t)(((int64_t)(b - a) * (int64_t)(r->pos & 0xffff)) >> 16));
++        r->pos += r->step;
++    }
++    r->pos -= n << 16;
++    r->prev = in[n - 1];
++    return o;
++}
++
++// Decodes the MP3 in `mp3` whole. On success *pcm_out holds the PCM
++// (freed by the voice task after playback) and *samples_out its length
++// in 16 kHz mono samples. False if nothing playable came out.
++static bool media_decode(const uint8_t *mp3, size_t len, int16_t **pcm_out, size_t *samples_out) {
++    mp3dec_t *dec = (mp3dec_t *)psram_alloc(sizeof(mp3dec_t));
++    int16_t *pcm = (int16_t *)psram_alloc(MINIMP3_MAX_SAMPLES_PER_FRAME * sizeof(int16_t));
++    size_t cap = MEDIA_MAX_SAMPLES;
++    int16_t *out = (int16_t *)psram_alloc(cap * sizeof(int16_t));
++    if (!dec || !pcm || !out) {
++        free(dec);
++        free(pcm);
++        free(out);
++        return false;
++    }
++    mp3dec_init(dec);
++    resampler_t rs = {0, 0, 0};   /* resampler_init() runs on the first frame's rate; this only satisfies the compiler */
++    int rate = 0, frames = 0;
++    size_t off = 0, n = 0;
++    while (off < len) {
++        mp3dec_frame_info_t info;
++        int samples = mp3dec_decode_frame(dec, mp3 + off, len - off, pcm, &info);
++        if (!info.frame_bytes) {
++            break;
++        }
++        off += info.frame_bytes;
++        if (!samples) {
++            continue;
++        }
++        frames++;
++        if (info.channels == 2) {
++            for (int k = 0; k < samples; k++) {
++                pcm[k] = (pcm[2 * k] + pcm[2 * k + 1]) / 2;
++            }
++        }
++        if (rate != info.hz) {
++            rate = info.hz;
++            resampler_init(&rs, info.hz, MEDIA_OUT_RATE);
++        }
++        if (n + (size_t)samples * MEDIA_OUT_RATE / rate + 2 > cap) {
++            break;
++        }
++        n += resample(&rs, pcm, samples, out + n);
++    }
++    ESP_LOGI(TAG, "decoded %u bytes, %d frames at %d Hz -> %u samples (%.2f s)",
++             (unsigned)len, frames, rate, (unsigned)n, n / (double)MEDIA_OUT_RATE);
++    free(dec);
++    free(pcm);
++    if (!n) {
++        free(out);
++        return false;
++    }
++    *pcm_out = out;
++    *samples_out = n;
++    return true;
++}
++
++// --- Command ------------------------------------------------------------
++
++// One resident worker runs the jobs: fetch, decode, and hand the PCM
++// to the voice task, which owns playback from there. The task is
++// created on the first command and never exits, so a play costs no
++// task creation (the bench selftest's decode task is per-run; this one
++// is not, because media.file is a command, not a bench test).
++static QueueHandle_t s_queue;
++
++static void media_run(media_job_t *job) {
++    char *url_path = vm_file_request_path(job->path);
++    if (!url_path) {
++        media_reply(job, false, 0, "out_of_memory", "could not build the media path");
++        goto out;
++    }
++    {
++        const char *code = NULL;
++        char msg[128];
++        size_t len = 0;
++        uint8_t *buf = media_fetch(url_path, &len, &code, msg, sizeof(msg));
++        free(url_path);
++        if (!buf) {
++            media_reply(job, false, 0, code, msg);
++            goto out;
++        }
++        int16_t *pcm = NULL;
++        size_t samples = 0;
++        bool decoded = media_decode(buf, len, &pcm, &samples);
++        heap_caps_free(buf);
++        if (!decoded) {
++            media_reply(job, false, 0, "decode_failed", "the file could not be decoded");
++            goto out;
++        }
++        ESP_LOGI(TAG, "playing %u bytes of MP3 from %s", (unsigned)len, job->path);
++        bool handed = false;
++        for (int i = 0; i < MEDIA_HANDOFF_TRIES && !handed; i++) {
++            handed = muse_voice_request_pcm(pcm, samples);
++            if (!handed) {
++                vTaskDelay(pdMS_TO_TICKS(MEDIA_HANDOFF_POLL_MS));
++            }
++        }
++        if (!handed) {
++            free(pcm);
++            media_reply(job, false, 0, "busy", "the voice task already has a play pending");
++            goto out;
++        }
++        media_reply(job, true, len, NULL, NULL);   // the voice task has it: playback starts
++    }
++out:
++    atomic_store(&s_busy, false);
++    free(job);
++}
++
++static void media_worker(void *arg) {
++    (void)arg;
++    for (;;) {
++        media_job_t *job = NULL;
++        if (xQueueReceive(s_queue, &job, portMAX_DELAY) == pdTRUE && job) {
++            media_run(job);
++        }
++    }
++}
++
++bool muse_media_start(const char *path, muse_media_done_cb done, void *user,
++                      const char **code, const char **message) {
++    if (!done || !path || !path[0] || strlen(path) >= 256) {
++        *code = "missing_param";
++        *message = "path is required";
++        return false;
++    }
++    bool expected = false;
++    if (!atomic_compare_exchange_strong(&s_busy, &expected, true)) {
++        *code = "busy";
++        *message = "a media fetch is already in progress";
++        return false;
++    }
++    if (!s_rx.lock) {
++        s_rx.lock = xSemaphoreCreateMutex();
++        if (!s_rx.lock) {
++            atomic_store(&s_busy, false);
++            *code = "out_of_memory";
++            *message = "could not create the media lock";
++            return false;
++        }
++    }
++    if (!s_queue) {
++        s_queue = xQueueCreate(1, sizeof(media_job_t *));
++        if (!s_queue) {
++            atomic_store(&s_busy, false);
++            *code = "out_of_memory";
++            *message = "could not create the media queue";
++            return false;
++        }
++        if (xTaskCreateWithCaps(media_worker, "muse_media", MEDIA_STACK_BYTES, NULL,
++                                5, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
++            vQueueDelete(s_queue);
++            s_queue = NULL;
++            atomic_store(&s_busy, false);
++            *code = "out_of_memory";
++            *message = "could not start the media worker";
++            return false;
++        }
++    }
++    media_job_t *job = calloc(1, sizeof(*job));
++    if (!job) {
++        atomic_store(&s_busy, false);
++        *code = "out_of_memory";
++        *message = "could not allocate the media job";
++        return false;
++    }
++    strncpy(job->path, path, sizeof(job->path) - 1);
++    job->done = done;
++    job->user = user;
++    job->t0_us = esp_timer_get_time();
++    if (xQueueSend(s_queue, &job, 0) != pdTRUE) {
++        free(job);
++        atomic_store(&s_busy, false);
++        *code = "busy";
++        *message = "a media fetch is already in progress";
++        return false;
++    }
++    return true;
++}
++
++#endif  // CONFIG_HOMEHUB_MP3_COMMAND
+diff --git a/esp32/main/muse_media.h b/esp32/main/muse_media.h
+new file mode 100644
+index 0000000..409b3c6
+--- /dev/null
++++ b/esp32/main/muse_media.h
+@@ -0,0 +1,52 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* The media.file command's result, in display.draw_file's shape. On
++ * success `bytes` is the file size and `ms` the time until playback
++ * started. On failure `code` and `message` say why, in the same words
++ * as the other commands' errors. The strings are valid only for the
++ * duration of the callback. */
++typedef struct {
++    bool ok;
++    size_t bytes;
++    uint32_t ms;
++    const char *code;
++    const char *message;
++} muse_media_result_t;
++
++typedef void (*muse_media_done_cb)(const muse_media_result_t *r, void *user);
++
++/* Fetches the MP3 file at `path` on the VM and plays it: a resident
++ * worker fetches and decodes it, and the voice task plays the PCM.
++ * Reports through `done` once playback is handed to the voice task
++ * (or at once, with an error). False, with *code and *message set, if
++ * the fetch cannot start. One fetch at a time. */
++bool muse_media_start(const char *path, muse_media_done_cb done, void *user,
++                      const char **code, const char **message);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/esp32/main/noise_control.cpp b/esp32/main/noise_control.cpp
+index 0789948..f2ee9d9 100644
+--- a/esp32/main/noise_control.cpp
++++ b/esp32/main/noise_control.cpp
+@@ -1654,6 +1654,19 @@ static char *build_register_json(void) {
+         cJSON_AddNumberToObject(
+             cJSON_GetObjectItem(commands, "display.draw_file"), "timeout_ms",
+             bits == 4 ? 120000 : 60000);
++#if CONFIG_HOMEHUB_MP3_COMMAND
++        cJSON *media_required = cJSON_CreateObject();
++        cJSON_AddItemToObject(media_required, "path",
++                              string_param("Path of the MP3 file on this VM, relative, "
++                                           "as the VM's file API takes it, e.g. "
++                                           "workspace/reply.mp3."));
++        add_command(commands, "media.file",
++                    "Fetch an MP3 file from this VM and play it as audio. "
++                    "Replies when playback starts.",
++                    media_required, nullptr);
++        cJSON_AddNumberToObject(
++            cJSON_GetObjectItem(commands, "media.file"), "timeout_ms", 60000);
++#endif
+         add_command(commands, "display.show_animation", restore, nullptr, nullptr);
+     }
+ #endif

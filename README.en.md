@@ -2,6 +2,8 @@
 
 media.file is a Link command that plays an MP3 stored on Muse's VM through an ESP32 gadget. Give the MP3's location in `path`, and the gadget fetches the file and plays it. The command replies at the moment playback starts.
 
+Try this: use the app or PC chat interface to ask, "Convert today's weather into an MP3 and send it back." Were you able to play the resulting file? If so, you can then send it to your gadget.
+
 ## Why I made it
 
 I wanted to hear Muse's replies through the gadget's speaker when I talk to the gadget. Muse can make the reply audio itself, so no external TTS is needed. If Muse makes an MP3 and media.file points at it, the gadget can play it.
